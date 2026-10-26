@@ -119,14 +119,36 @@ def pad_to_multiple(array, multiple=8):
     return np.pad(array, widths, mode="reflect"), (H, W)
 
 
+LOADED_LAMA_MODELS = {}
+
+
+def preferred_device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def lama_model(device):
+    key = (weights_path(), device)
+    if key not in LOADED_LAMA_MODELS: LOADED_LAMA_MODELS[key] = torch.jit.load(key[0], map_location=device).eval()
+    return LOADED_LAMA_MODELS[key]
+
+
+def run_lama(image_tensor, mask_tensor, device):
+    with torch.no_grad():
+        return lama_model(device)(image_tensor.to(device), mask_tensor.to(device))[0].permute(1, 2, 0).cpu().numpy()
+
+
 def inpaint_lama(rgb, mask):
-    model = torch.jit.load(weights_path(), map_location="cpu").eval()
     image, (H, W) = pad_to_multiple(np.clip(rgb, 0, 1).astype(np.float32))
     hole, _ = pad_to_multiple(mask.astype(np.float32))
     image_tensor = torch.from_numpy(image).permute(2, 0, 1)[None]
     mask_tensor = torch.from_numpy(hole)[None, None]
-    with torch.no_grad():
-        result = model(image_tensor, mask_tensor)[0].permute(1, 2, 0).cpu().numpy()
+    device = preferred_device()
+    try:
+        result = run_lama(image_tensor, mask_tensor, device)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print("LaMa ran out of GPU memory on this scan; running it on the CPU instead")
+        result = run_lama(image_tensor, mask_tensor, "cpu")
     return np.clip(result[:H, :W].astype(np.float64), 0, 1)
 
 
