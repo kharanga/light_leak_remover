@@ -6,11 +6,9 @@ requires-python = ">=3.9"
 dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "scipy>=1.10", "gradio>=4.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
 propose = ["anthropic"]
 inpaint = ["torch>=2.0"]
 detect = ["ultralytics>=8.3"]
-notebooks = ["matplotlib>=3.8", "nbclient>=0.10", "ipykernel>=6.29"]
 
 [project.scripts]
 leakfix = "leakfix.app:main"
@@ -22,7 +20,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["leakfix"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests", "docs"]
-addopts = "--doctest-glob=*.md"

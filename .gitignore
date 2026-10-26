@@ -46,3 +46,6 @@ scripts/
 #docs
 docs/
 
+
+#local test config
+pytest.ini
