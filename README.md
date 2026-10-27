@@ -21,17 +21,6 @@ The notebook takes one scan through the whole process, with no boxes to draw:
 
 If the detector misses a leak, lower `CONFIDENCE` or give the boxes yourself in `MANUAL_BOXES`.
 
-### Train the leak detector
-
-The detector is a YOLO model trained on my labelled scans: 174 scans, split 126 / 24 / 24 into train, validation and test. It reaches mAP50 0.47 on the test split.
-
-    python -m leakfix.yolo_data --dataset dataset --out work/yolo      # labelled boxes -> YOLO dataset
-    python -m leakfix.detect train work/yolo/data.yaml --out work/detect
-    python -m leakfix.detect evaluate work/detect/weights/best.pt work/yolo/data.yaml
-    python -m leakfix.detect propose models/leak_detector.pt scan.jpg
-
-`dataset/` holds one `<scan>.boxes.json` per labelled scan, with the scans in `photos/original/`. Training uses flips and rotations only, never colour augmentation, so the leak colours are left as they are.
-
 ## Conclusion
 
 - **Eye test:** Gemini on the raw scan, without the in-house processing, was ranked first on 75% of the scans (109 of 145).
@@ -49,6 +38,44 @@ The detector is a YOLO model trained on my labelled scans: 174 scans, split 126 
 | In-house + NB 2.1 | In-house output, then Nano Banana 2.1. | yes | yes |
 
 > **Gemini Prompt:** Remove the light leak from this, but keep the film aspect
+
+## Finding the leaks: YOLO detector
+
+In the notebook, the leak boxes come from a YOLO object detector instead of being drawn by hand. For the tests below, I used the boxes I drew myself, so the comparison does not depend on the detector.
+
+**What it does**
+
+1. Take the whole scan, resized so the long side is 1024 px.
+2. Return a box and a confidence score (0 to 1) for each light leak.
+3. Keep the boxes above the confidence threshold (0.25 by default). These are passed to the in-house method and shown before anything runs.
+
+**How it was trained**
+
+- **Data:** 174 of my scans. 171 have leak boxes I drew by hand, and 3 have no leak, so the model also sees negative examples.
+- **Split:** 126 scans to train on, 24 to tune on (validation) and 24 held back for the final test. Scans are grouped by the leak's shape (vertical band, horizontal band or edge leak) before splitting, so every split has a mix of leak types. The split is frozen, so retraining always tests on the same 24 scans.
+- **Model:** YOLO26m (20 M parameters), fine-tuned for up to 150 epochs, stopping early if the validation score stops improving for 30 epochs. The released model trained for 107 epochs.
+- **Augmentation:** horizontal and vertical flips, plus a copy of every training scan rotated 90°, because leaks can appear on any side of the frame. There is no colour augmentation: a leak is defined by its colour, so changing colours during training would teach the model the wrong thing.
+
+**Results on the 24 test scans (30 leaks)**
+
+| Precision | Recall | mAP50 | mAP50-95 |
+|---:|---:|---:|---:|
+| 0.40 | 0.53 | 0.47 | 0.16 |
+
+- **Precision:** the share of the detector's boxes that match a real leak.
+- **Recall:** the share of real leaks it finds.
+- **mAP50:** overall accuracy, counting a box as correct when it overlaps the true box by at least half. mAP50-95 uses stricter overlap thresholds.
+
+**Limits:** with only 126 training scans, the detector finds about half the leaks and its boxes are often looser than hand-drawn ones. Faint leaks can fall below the threshold. That is why the notebook shows the detected boxes before running anything, and lets you lower `CONFIDENCE` or give the boxes yourself in `MANUAL_BOXES`. More labelled scans should improve it.
+
+**Train it yourself**
+
+    python -m leakfix.yolo_data --dataset dataset --out work/yolo      # labelled boxes -> YOLO dataset and split
+    python -m leakfix.detect train work/yolo/data.yaml --out work/detect
+    python -m leakfix.detect evaluate work/detect/weights/best.pt work/yolo/data.yaml
+    python -m leakfix.detect propose models/leak_detector.pt scan.jpg
+
+`dataset/` holds one `<scan>.boxes.json` per labelled scan, with the scans in `photos/original/`. Training needs the `detect` extra (`pip install -e ".[detect]"`) and a GPU is recommended.
 
 ## Preprocessing: the in-house method
 
