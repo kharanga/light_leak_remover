@@ -1,51 +1,23 @@
-# virtualenv (named .env in this project)
+# Python
 .env/
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# agent handoff files are working state, not source
-handoff/
-
-# scans, outputs and labels
+# Scans, outputs and labels
 photos/
+dataset/
+work/
 *.jpg
 *.jpeg
 *.png
 *.boxes.json
-!docs/results/*.jpg
+!assets/readme/*.jpg
+!assets/readme/*.png
 
-# model weights
+# Model weights
 *.pt
 *.pth
 *.safetensors
-
-# build metadata
-*.egg-info/
-
-# labelling run outputs
-work/
-dataset/
-
-# agentic related instructions
-SPEC.md
-CLAUDE.md
-.claude/
-
-
-#test
-tests/
-
-#notebooks
-notebooks
-
-#vm setup
-scripts/
-
-#docs
-docs/
-
-
-#local test config
-pytest.ini
