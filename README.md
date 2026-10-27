@@ -6,33 +6,20 @@ I tested 145 film scans, each with at least one light leak. Each scan was fixed 
 
 ## Install and run
 
-    bash setup_env.sh              # creates .env with every dependency and registers the Jupyter kernel "Python (leakfix)"
-    source .env/bin/activate
-    python -m leakfix.app          # local web app at http://127.0.0.1:7860
+    bash setup_env.sh
 
-Or install by hand: `pip install -r requirements.txt` then `pip install -e .` (add `.[notebook]` for the notebook extras).
+This creates the `.env` virtualenv with every dependency and registers the Jupyter kernel **Python (leakfix)**. To install by hand instead: `pip install -r requirements.txt` then `pip install -e ".[notebook]"`.
 
-In the app, load a scan, drag one box around each light leak and press **Apply**. Check the result with *Show original | current*, then press **Save full-resolution JPEG** to write `<scan>_fixed.jpg` next to the scan. Every applied box is logged in `<scan>.boxes.json`.
+Everything runs from `notebooks/end_to_end.ipynb`. Open it, select the kernel **Python (leakfix)**, set `IMAGE_PATH` to your scan (a sample is in `samples/`) and run all cells. The Gemini steps need `GEMINI_API_KEY` in the environment.
 
-The same method from the command line:
-
-    python -m leakfix.cli scan.jpg --recipe v2 --leak x0,x1,y0,y1 -o fixed.jpg
-    python -m leakfix.cli scan.jpg --replay scan.boxes.json -o fixed.jpg
-
-To measure how much another version of a scan (for example a Gemini edit) changed it outside the leak boxes:
-
-    leakfix-compare scan.jpg --version gemini=gemini.png --boxes scan.boxes.json
-
-### End-to-end notebook
-
-`notebooks/end_to_end.ipynb` takes one scan and runs the whole process with no boxes to draw:
+The notebook takes one scan through the whole process, with no boxes to draw:
 
 1. The YOLO leak detector (`models/leak_detector.pt`) finds the leaks.
 2. The in-house method runs inside the detected boxes.
 3. Nano Banana Pro and Nano Banana 2.1 each run on the raw scan and on the in-house result.
-4. The four results are shown side by side with their ΔE76 outside the boxes and leak left inside them.
+4. The four results are shown side by side with their ΔE76 outside the boxes and leak left inside them, and saved to `work/end_to_end/<scan>/`.
 
-Select the kernel **Python (leakfix)**, set `IMAGE_PATH` (a sample is in `samples/`) and run all cells. The Gemini steps need `GEMINI_API_KEY` in the environment.
+If the detector misses a leak, lower `CONFIDENCE` or give the boxes yourself in `MANUAL_BOXES`.
 
 ### Train the leak detector
 

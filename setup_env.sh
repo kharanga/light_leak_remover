@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the project virtualenv and install everything the app, the CLI and the notebooks need.
+# Create the project virtualenv and install everything the notebook needs.
 #
 #   bash setup_env.sh                 # creates ./.env (or updates it if it already exists)
 #   VENV=myenv bash setup_env.sh      # use another folder
@@ -32,7 +32,7 @@ fi
 PIP="$VENV/bin/python -m pip"
 $PIP install --upgrade pip
 
-# app and CLI
+# core dependencies
 $PIP install -r requirements.txt
 echo "installing the leakfix package (editable)..."
 $PIP install --upgrade setuptools wheel
@@ -48,7 +48,7 @@ $PIP install ultralytics "google-genai>=1.0" ipykernel
 
 "$VENV/bin/python" - <<'EOF'
 import importlib.util
-for name in ("numpy", "cv2", "scipy", "skimage", "gradio", "matplotlib", "ultralytics", "google.genai", "leakfix"):
+for name in ("numpy", "cv2", "scipy", "skimage", "matplotlib", "ultralytics", "google.genai", "leakfix"):
     found = importlib.util.find_spec(name) is not None
     print(f"  {name:12} {'ok' if found else 'MISSING'}")
 EOF

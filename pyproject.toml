@@ -3,17 +3,12 @@ name = "leakfix"
 version = "0.1.0"
 description = "Light-leak removal for film scans"
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "scipy>=1.10", "gradio>=4.0", "scikit-image>=0.22", "matplotlib>=3.8"]
+dependencies = ["numpy>=1.24", "opencv-python-headless>=4.8", "scipy>=1.10", "scikit-image>=0.22", "matplotlib>=3.8"]
 
 [project.optional-dependencies]
 detect = ["ultralytics>=8.3"]
 gemini = ["google-genai>=1.0"]
 notebook = ["ultralytics>=8.3", "google-genai>=1.0", "ipykernel"]
-
-[project.scripts]
-leakfix = "leakfix.app:main"
-leakfix-cli = "leakfix.cli:main"
-leakfix-compare = "leakfix.compare:main"
 
 [build-system]
 requires = ["setuptools>=61"]
