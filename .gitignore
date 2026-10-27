@@ -21,3 +21,5 @@ work/
 *.pt
 *.pth
 *.safetensors
+!samples/*.jpg
+!models/leak_detector.pt

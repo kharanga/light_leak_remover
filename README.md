@@ -6,10 +6,11 @@ I tested 145 film scans, each with at least one light leak. Each scan was fixed 
 
 ## Install and run
 
-    pip install -r requirements.txt
+    bash setup_env.sh              # creates .env with every dependency and registers the Jupyter kernel "Python (leakfix)"
+    source .env/bin/activate
     python -m leakfix.app          # local web app at http://127.0.0.1:7860
 
-Or `pip install -e .` then `leakfix`.
+Or install by hand: `pip install -r requirements.txt` then `pip install -e .` (add `.[notebook]` for the notebook extras).
 
 In the app, load a scan, drag one box around each light leak and press **Apply**. Check the result with *Show original | current*, then press **Save full-resolution JPEG** to write `<scan>_fixed.jpg` next to the scan. Every applied box is logged in `<scan>.boxes.json`.
 
@@ -21,6 +22,28 @@ The same method from the command line:
 To measure how much another version of a scan (for example a Gemini edit) changed it outside the leak boxes:
 
     leakfix-compare scan.jpg --version gemini=gemini.png --boxes scan.boxes.json
+
+### End-to-end notebook
+
+`notebooks/end_to_end.ipynb` takes one scan and runs the whole process with no boxes to draw:
+
+1. The YOLO leak detector (`models/leak_detector.pt`) finds the leaks.
+2. The in-house method runs inside the detected boxes.
+3. Nano Banana Pro and Nano Banana 2.1 each run on the raw scan and on the in-house result.
+4. The four results are shown side by side with their ΔE76 outside the boxes and leak left inside them.
+
+Select the kernel **Python (leakfix)**, set `IMAGE_PATH` (a sample is in `samples/`) and run all cells. The Gemini steps need `GEMINI_API_KEY` in the environment.
+
+### Train the leak detector
+
+The detector is a YOLO model trained on my labelled scans: 174 scans, split 126 / 24 / 24 into train, validation and test. It reaches mAP50 0.47 on the test split.
+
+    python -m leakfix.yolo_data --dataset dataset --out work/yolo      # labelled boxes -> YOLO dataset
+    python -m leakfix.detect train work/yolo/data.yaml --out work/detect
+    python -m leakfix.detect evaluate work/detect/weights/best.pt work/yolo/data.yaml
+    python -m leakfix.detect propose models/leak_detector.pt scan.jpg
+
+`dataset/` holds one `<scan>.boxes.json` per labelled scan, with the scans in `photos/original/`. Training uses flips and rotations only, never colour augmentation, so the leak colours are left as they are.
 
 ## Conclusion
 
