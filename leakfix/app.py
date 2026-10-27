@@ -1,6 +1,6 @@
 import base64, json, os, tempfile, time, numpy as np, cv2, gradio as gr
 from pathlib import Path
-from . import core, propose, inpaint, detect, recipe
+from . import core, recipe, compare as collateral
 
 PREVIEW_MAX = 1600
 STEP_INFO = {
@@ -8,18 +8,17 @@ STEP_INFO = {
     "2 · Remove blue tint (cool)": "Draw a box around any cyan/blue patch left after step 1. Same method with channels swapped, gentler.",
     "3 · Match exposure":       "Draw one box per dull patch, press 'Next drag = reference', then drag a REFERENCE box of the same surface that looks right (same rows). All patches are lifted to the reference's brightness in linear light.",
     "4 · Neutralize warm (HSV)": "Final pass, automatic: masks bright warm pixels (hue 0–25, sat ≥ 40, value ≥ 180) inside the leak boxes from steps 1–3 (padded by one tile), softens the mask and pulls red toward green by the strength. Tick 'whole frame' to run everywhere; draw boxes to override.",
-    "5 · Inpaint residue (opt-in)": "Only for clipped cores (red ≥ 0.97 while blue is not, in the ORIGINAL scan). Draw a box around the pale bar; LaMa when torch and big-lama.pt are present, else OpenCV Telea; colour matched to a 61 px ring, the scan's own grain blended back, seam feathered. Refuses when the mask is over 15 % of the frame. This step invents pixels: use it last and sparingly.",
-    "R · Recipe v2 (main path)": "The main path: draw one box per light leak and press Apply. Runs the whole recipe at fixed gains (no strength control): the boxes are padded by two tiles, two deleak passes (1.3, 1.3), blue tint only where it is cyan against the same row, exposure matched to a side strip whose rows follow the box edge, HSV 0.45, a black-point floor, then a per-tile fade so only leak tiles change. Logged as one recipe_v2 stage that `cli --replay` reproduces. Steps 1–5 stay available as the manual path.",
+    "R · Recipe v2 (main path)": "The main path: draw one box per light leak and press Apply. Runs the whole recipe at fixed gains (no strength control): the boxes are padded by two tiles, two deleak passes (1.3, 1.3), blue tint only where it is cyan against the same row, exposure matched to a side strip whose rows follow the box edge, HSV 0.45, a black-point floor, then a per-tile fade so only leak tiles change. Logged as one recipe_v2 stage that `cli --replay` reproduces. Steps 1–4 stay available as the manual path.",
 }
 RECIPE_MODE = "R · Recipe v2 (main path)"
 UNDO_LOG_EDITED_NOTE = "log not changed (boxes.json was edited elsewhere)"
 UNDO_LOG_UNCHANGED_PREFIX = "log not changed ("
-INPAINT_METHODS = ("auto", "telea", "lama")
-INPAINT_MASK_MODES = ("clip", "score", "box")
 TILE_CHOICES = ("auto", "64", "32", "16")
-PROPOSAL_COLOURS = {"leak": (255, 80, 0), "cool_tint": (0, 200, 255), "dull": (230, 230, 0), "hsv": (255, 0, 200)}
-PROPOSAL_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
-PROPOSAL_STEP = {"leak": "1", "cool_tint": "2", "dull": "3", "hsv": "4"}
+COMPARE_SLOTS = 3
+COMPARE_OUT_DIR = "work/compare"
+COMPARE_CSV = "work/compare/compare.csv"
+COMPARE_FILE_BOX_COLOUR = (255, 255, 255)
+COMPARE_DRAWN_BOX_COLOUR = (255, 160, 0)
 
 def _tile_from_choice(choice, shape):
     return core.resolve_tile(None if choice == "auto" else int(choice), shape)
@@ -93,22 +92,6 @@ def _draw_boxes(prev_u8, boxes, scale, colours):
         cv2.rectangle(im, (int(x0 * scale), int(y0 * scale)), (int(x1 * scale) - 1, int(y1 * scale) - 1), col, 3)
     return im
 
-def _dashed_rectangle(im, x0, y0, x1, y1, colour, dash=12, thickness=2):
-    def along(a, b, fixed, horizontal):
-        for start in range(a, b, dash * 2):
-            end = min(start + dash, b)
-            p0, p1 = ((start, fixed), (end, fixed)) if horizontal else ((fixed, start), (fixed, end))
-            cv2.line(im, p0, p1, colour, thickness)
-    along(x0, x1, y0, True); along(x0, x1, y1, True); along(y0, y1, x0, False); along(y0, y1, x1, False)
-
-def _draw_proposals(prev_u8, proposals, scale):
-    im = prev_u8.copy()
-    for i, p in enumerate(proposals):
-        x0, x1, y0, y1 = p["box"]; colour = PROPOSAL_COLOURS.get(p["cls"], (255, 255, 255))
-        _dashed_rectangle(im, int(x0 * scale), int(y0 * scale), int(x1 * scale) - 1, int(y1 * scale) - 1, colour)
-        cv2.putText(im, f"P{i} {p['cls']} {p['confidence']:.2f}", (int(x0 * scale) + 6, int(y0 * scale) + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
-    return im
-
 def _data_url(rgb_u8):
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
     return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
@@ -116,7 +99,7 @@ def _data_url(rgb_u8):
 def _new_state(path):
     rgb = core.load(path); prev, s = _preview(rgb)
     return {"path": path, "orig": rgb, "cur": rgb.copy(), "history": [], "scale": s, "prev": prev,
-            "boxes": [], "box_sources": [], "ref": None, "next_is_ref": False, "applied": [], "proposals": [],
+            "boxes": [], "box_sources": [], "ref": None, "next_is_ref": False, "applied": [],
             "log": str(Path(path).with_suffix(".boxes.json"))}
 
 def _pad_box(box, pad, W, H):
@@ -143,81 +126,6 @@ def on_select(state, mode, evt: gr.SelectData):
 def _add_box(state, box, source):
     state["boxes"].append(tuple(box)); state["box_sources"].append(source)
 
-def _proposal_choices(state):
-    return [f"P{i} {p['cls']} {p['confidence']:.2f} {p['box']}" for i, p in enumerate(state["proposals"])] if state else []
-
-def _proposal_index(choice):
-    try: return int(str(choice).split()[0][1:])
-    except (ValueError, IndexError, AttributeError): return None
-
-def propose_click(state, mode, model):
-    if state is None: return state, "", "Load a scan first.", gr.update(choices=[], value=None)
-    proposals, reason = propose.propose_boxes(state["cur"], model=model or propose.DEFAULT_MODEL)
-    for p in proposals: p["model"] = model or propose.DEFAULT_MODEL
-    state["proposals"] = proposals
-    if not proposals:
-        msg = f"No proposals ({reason})." if reason else "No proposals: the model found nothing to box."
-    else:
-        msg = f"{len(proposals)} proposal(s) from {model or propose.DEFAULT_MODEL}, dashed on the image. Pick one and Accept / Adjust / Dismiss; nothing is applied until you press Apply. " + "; ".join(f"P{i} {p['cls']} {p['confidence']:.2f}: {p['note']}" for i, p in enumerate(proposals))
-    choices = _proposal_choices(state)
-    return state, _render(state, mode), msg, gr.update(choices=choices, value=choices[0] if choices else None)
-
-def yolo_button_label():
-    return "Propose (YOLO)" if detect.available() else f"Propose (YOLO): {detect.INSTALL_HINT}"
-
-def yolo_proposals(detected, weights):
-    return [{"cls": "leak", "box": tuple(box), "confidence": confidence, "note": "yolo detector", "model": os.path.basename(weights), "source": "yolo"} for box, confidence in detected]
-
-def yolo_propose_click(state, mode, weights, conf):
-    if state is None: return state, "", "Load a scan first.", gr.update(choices=[], value=None)
-    if not detect.available(): return state, _render(state, mode), f"YOLO proposals need ultralytics: {detect.INSTALL_HINT}.", gr.update(choices=_proposal_choices(state))
-    weights = weights or detect.DEFAULT_WEIGHTS
-    try:
-        detected = detect.propose_rgb(detect.load_detector(weights), state["cur"], conf=float(conf))
-    except (FileNotFoundError, RuntimeError) as e:
-        return state, _render(state, mode), f"No YOLO proposals: {e}", gr.update(choices=_proposal_choices(state))
-    state["proposals"] = yolo_proposals(detected, weights)
-    msg = (f"{len(detected)} YOLO proposal(s) from {os.path.basename(weights)}, dashed on the image. Pick one and Accept / Adjust / Dismiss; nothing is applied until you press Apply."
-           if detected else f"No YOLO proposals above confidence {float(conf):.2f}.")
-    choices = _proposal_choices(state)
-    return state, _render(state, mode), msg, gr.update(choices=choices, value=choices[0] if choices else None)
-
-def _take_proposal(state, choice):
-    i = _proposal_index(choice)
-    if i is None or not state["proposals"] or i >= len(state["proposals"]): return None
-    return state["proposals"].pop(i)
-
-def _record_proposal(state, proposal, accepted, adjusted=False):
-    entry = {"cls": proposal["cls"], "box": list(map(int, proposal["box"])), "confidence": proposal["confidence"], "note": proposal["note"],
-             "model": proposal.get("model"), "source": proposal.get("source", "claude"), "accepted": accepted, "adjusted": adjusted, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
-    log = _read_log(state["log"], os.path.basename(state["path"]))
-    log.setdefault("proposals", []).append(entry)
-    _write_atomic(state["log"], json.dumps(log, indent=2))
-
-def _resolve_proposal(state, mode, choice, accepted, adjusted=False):
-    if state is None: return state, "", "Load a scan first.", gr.update(choices=[], value=None)
-    proposal = _take_proposal(state, choice)
-    if proposal is None: return state, _render(state, mode), "No proposal selected.", gr.update(choices=_proposal_choices(state))
-    try:
-        _record_proposal(state, proposal, accepted, adjusted)
-    except (OSError, ValueError) as e:
-        state["proposals"].append(proposal)
-        return state, _render(state, mode), f"Not recorded: could not write {os.path.basename(state['log'])}: {e}", gr.update(choices=_proposal_choices(state))
-    if accepted:
-        _add_box(state, proposal["box"], proposal.get("source", "claude"))
-        step = PROPOSAL_STEP.get(proposal["cls"], "?")
-        msg = f"Accepted P {proposal['cls']} {proposal['box']} as box {len(state['boxes'])-1} (a step {step} box). " + ("Clear boxes and redraw to adjust, then " if adjusted else "") + "Press Apply to use it."
-    else:
-        msg = f"Dismissed {proposal['cls']} {proposal['box']} (logged as a hard negative)."
-    choices = _proposal_choices(state)
-    return state, _render(state, mode), msg, gr.update(choices=choices, value=choices[0] if choices else None)
-
-def accept_proposal(state, mode, choice): return _resolve_proposal(state, mode, choice, True)
-
-def adjust_proposal(state, mode, choice): return _resolve_proposal(state, mode, choice, True, adjusted=True)
-
-def dismiss_proposal(state, mode, choice): return _resolve_proposal(state, mode, choice, False)
-
 def _next_drag_hint(state, mode):
     if not mode.startswith("3"): return ""
     if state["next_is_ref"]: return " Next drag: REFERENCE box."
@@ -237,13 +145,13 @@ def change_step(mode, state):
     _clear_pending_reference(state)
     return STEP_INFO[mode], _render(state, mode), _default_strength(mode), ("Recipe v2." if mode == RECIPE_MODE else f"Step {mode[0]}.") + _next_drag_hint(state, mode)
 
-def _default_strength(mode): return {"1": 1.3, "2": 0.9, "3": 1.0, "4": 0.45, "5": inpaint.MAX_MASK_FRACTION, "R": recipe.SECOND_GAIN}[mode[0]]
+def _default_strength(mode): return {"1": 1.3, "2": 0.9, "3": 1.0, "4": 0.45, "R": recipe.SECOND_GAIN}[mode[0]]
 
 def _render(state, mode):
     cols = [(255, 160, 0)] * len(state["boxes"]) if not mode.startswith("2") else [(0, 200, 255)] * len(state["boxes"])
     boxes, colours = list(state["boxes"]), cols
     if state["ref"]: boxes.append(state["ref"]); colours.append((80, 255, 120))
-    return _data_url(_draw_boxes(_draw_proposals(state["prev"], state.get("proposals", []), state["scale"]), boxes, state["scale"], colours))
+    return _data_url(_draw_boxes(state["prev"], boxes, state["scale"], colours))
 
 def clear_boxes(state, mode):
     if state is None: return state, "", ""
@@ -270,14 +178,14 @@ def _remove_last_stage(state, entry):
     log["stages"].pop(); _write_atomic(state["log"], json.dumps(log, indent=2))
     return True
 
-def apply(state, mode, gain, second, max_stops, whole_frame, tile_choice="auto", inpaint_method="auto", inpaint_mask="clip"):
+def apply(state, mode, gain, second, max_stops, whole_frame, tile_choice="auto"):
     if state is None: return state, "", "Load a scan first."
     try:
-        return _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice, inpaint_method, inpaint_mask)
+        return _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice)
     except ValueError as e:
         return state, _render(state, mode), f"Not applied: {e}"
 
-def _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice, inpaint_method="auto", inpaint_mask="clip"):
+def _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice):
     if not state["boxes"] and not mode.startswith("4"): return state, _render(state, mode), "Draw at least one box."
     before = state["cur"]; out = before.copy(); notes = []; t = time.time(); H, W = before.shape[:2]
     used, ref, added, extra = list(state["boxes"]), None, [], {}
@@ -295,11 +203,6 @@ def _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice, 
         for i, b in enumerate(used or [None]):
             out, frac = core.hsv_neutralize(out, b, strength=gain); notes.append(f"{'box %d' % i if b else 'whole frame'}: mask {frac*100:.1f}% of frame")
         stage, param = "hsv", gain
-    elif mode.startswith("5"):
-        for i, b in enumerate(used):
-            out, info = inpaint.inpaint_residue(out, state["orig"], b, method=inpaint_method, mask_mode=inpaint_mask)
-            notes.append(f"box {i}: mask {info['mask_fraction']*100:.2f}% of frame, " + (f"filled with {info['method']}" if info["applied"] else "not applied"))
-        stage, param, extra = "inpaint", inpaint.MAX_MASK_FRACTION, {"method": info["method"], "mask_mode": inpaint_mask}
     elif mode.startswith("1"):
         for i, b in enumerate(used):
             out, f, af = core.deleak(out, b, gain=gain, second_pass=second, tile=tile); notes.append(f"box {i}: peak {f[...,0].max():.3f}, blue frac {af:.2f}")
@@ -318,7 +221,6 @@ def _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice, 
     inside, outside = core.audit(before, out, audit_boxes or used or [(0, W, 0, H)])
     if used == list(state["boxes"]) and state["box_sources"]:
         extra = dict(extra, sources=list(state["box_sources"]))
-        if any(source != "human" for source in state["box_sources"]): extra["model"] = _last_proposal_model(state)
     try:
         entry = _log(state, stage, used, ref, param, extra)
     except (OSError, ValueError) as e:
@@ -327,14 +229,6 @@ def _apply_step(state, mode, gain, second, max_stops, whole_frame, tile_choice, 
     state["boxes"] = []; state["box_sources"] = []; _clear_pending_reference(state)
     msg = f"{stage}: " + "; ".join(notes) + f"\nchange inside {inside.round(1)}  outside {outside.round(2)}  ({time.time()-t:.1f}s)" + _next_drag_hint(state, mode)
     return state, _render(state, mode), msg
-
-def _last_proposal_model(state):
-    try:
-        log = _read_log(state["log"], os.path.basename(state["path"]))
-        accepted = [p for p in log.get("proposals", []) if p.get("accepted")]
-        return accepted[-1]["model"] if accepted else None
-    except (OSError, ValueError):
-        return None
 
 def _read_log(path, image_name):
     if not os.path.exists(path): return {"image": image_name, "stages": []}
@@ -395,59 +289,143 @@ def compare(state):
     a, _ = _preview(state["orig"]); b = state["prev"]; return np.hstack([a, b])
 
 
+def _fix_tab_log_for(fix_state, original_path):
+    if not fix_state or os.path.basename(fix_state["path"]) != os.path.basename(original_path): return None
+    return fix_state["log"] if os.path.exists(fix_state["log"]) else None
+
+def _compare_boxes(cstate):
+    return collateral.unique_union(cstate["file_boxes"] + cstate["drawn_boxes"])
+
+def _compare_render(cstate):
+    boxes = cstate["file_boxes"] + cstate["drawn_boxes"]
+    colours = [COMPARE_FILE_BOX_COLOUR] * len(cstate["file_boxes"]) + [COMPARE_DRAWN_BOX_COLOUR] * len(cstate["drawn_boxes"])
+    return _data_url(_draw_boxes(cstate["prev"], boxes, cstate["scale"], colours))
+
+def _compare_box_note(cstate):
+    return f"{len(cstate['file_boxes'])} box(es) from {cstate['boxes_source'] or 'no boxes.json'}, {len(cstate['drawn_boxes'])} drawn."
+
+def _with_file_boxes(cstate, path, source):
+    try:
+        cstate["file_boxes"] = collateral.read_label_boxes(path); cstate["boxes_source"] = source
+        return ""
+    except (ValueError, OSError) as e:
+        cstate["file_boxes"] = []; cstate["boxes_source"] = None
+        return f" Boxes file ignored: {e}."
+
+def compare_load_original(file, fix_state):
+    if file is None: return None, "", "Load the original scan to compare against."
+    try:
+        rgb = core.load(file)
+    except (FileNotFoundError, ValueError) as e:
+        return None, "", f"Could not load the original: {e}"
+    prev, s = _preview(rgb)
+    cstate = {"path": file, "shape": rgb.shape, "prev": prev, "scale": s, "file_boxes": [], "drawn_boxes": [], "boxes_source": None}
+    log = _fix_tab_log_for(fix_state, file)
+    note = _with_file_boxes(cstate, log, f"{Path(log).name} (Fix tab)") if log else ""
+    return cstate, _compare_render(cstate), f"{rgb.shape[1]}×{rgb.shape[0]} original loaded. " + _compare_box_note(cstate) + note + " Drag on the image to add boxes."
+
+def compare_load_boxes(file, cstate):
+    if cstate is None: return cstate, "", "Load the original first."
+    if file is None:
+        cstate["file_boxes"] = []; cstate["boxes_source"] = None
+        return cstate, _compare_render(cstate), _compare_box_note(cstate)
+    note = _with_file_boxes(cstate, file, Path(file).name)
+    return cstate, _compare_render(cstate), _compare_box_note(cstate) + note
+
+def compare_on_select(cstate, evt: gr.SelectData):
+    if cstate is None: return cstate, "", "Load the original first."
+    box = tuple(int(v / cstate["scale"]) for v in evt.index)
+    if box[1] - box[0] < 16 or box[3] - box[2] < 16: return cstate, _compare_render(cstate), "Box too small, drag a larger one."
+    cstate["drawn_boxes"].append(box)
+    return cstate, _compare_render(cstate), f"Drawn box {box}. " + _compare_box_note(cstate)
+
+def compare_clear_drawn(cstate):
+    if cstate is None: return cstate, "", "Load the original first."
+    cstate["drawn_boxes"] = []
+    return cstate, _compare_render(cstate), _compare_box_note(cstate)
+
+def _compare_versions_from(slots):
+    versions = []
+    for index, (path, label) in enumerate(slots, start=1):
+        if path: versions.append(((label or "").strip() or Path(path).stem or f"version{index}", path))
+    return versions
+
+def compare_run(cstate, margin, csv_path, out_dir, *slot_values):
+    if cstate is None: return None, "", "Load the original first."
+    slots = list(zip(slot_values[0::2], slot_values[1::2]))
+    lines = []
+    try:
+        rows, figure_path = collateral.compare_versions(cstate["path"], _compare_versions_from(slots), _compare_boxes(cstate),
+                                                        int(margin), csv_path or COMPARE_CSV, out_dir or COMPARE_OUT_DIR, report=lines.append)
+    except (ValueError, OSError) as e:
+        return None, "", f"Compare failed: {e}"
+    return figure_path, "```\n" + collateral.table_text(rows) + "\n```", "\n".join(line for line in lines if "\n" not in line)
+
+
 def build():
     with gr.Blocks(title="Leak Fix") as demo:
         gr.Markdown("## Leak Fix — light-leak removal for film scans\nDraw boxes (press on the image and drag in any direction), choose a step, Apply. Steps chain: each one works on the previous result. Nothing outside your boxes is changed.")
         state = gr.State(None)
-        with gr.Row():
-            with gr.Column(scale=3):
-                img = gr.HTML(value="", label="scan (press and drag to draw a box)", show_label=True, container=True,
-                              html_template=STAGE_HTML, css_template=STAGE_CSS, js_on_load=STAGE_JS)
-                status = gr.Textbox(label="status", lines=2, interactive=False)
-            with gr.Column(scale=1):
-                file = gr.File(label="scan", file_types=["image"], type="filepath")
-                mode = gr.Radio(list(STEP_INFO), value=RECIPE_MODE, label="step")
-                info = gr.Markdown(STEP_INFO[RECIPE_MODE])
-                gain = gr.Slider(0.1, 2.0, 1.3, step=0.05, label="strength (steps 1–2: gain · step 4: blend 0–1)")
-                second = gr.Checkbox(True, label="leftover pass at half the tile (steps 1–2)")
-                tile_choice = gr.Dropdown(list(TILE_CHOICES), value="auto", label="tile, px (steps 1–2: auto = 64 / 32 / 16 by image size)")
-                max_stops = gr.Slider(0.25, 2.0, 1.0, step=0.25, label="max lift, stops (step 3)")
-                whole_frame = gr.Checkbox(False, label="step 4: whole frame instead of leak boxes")
-                with gr.Row():
-                    inpaint_method = gr.Dropdown(list(INPAINT_METHODS), value="auto", label="step 5 method")
-                    inpaint_mask = gr.Dropdown(list(INPAINT_MASK_MODES), value="clip", label="step 5 mask")
-                with gr.Row():
-                    apply_btn = gr.Button("Apply", variant="primary"); clear_btn = gr.Button("Clear boxes"); undo_btn = gr.Button("Undo")
-                ref_btn = gr.Button("Next drag = reference (step 3)")
-                with gr.Group():
-                    with gr.Group(visible=propose.available()):
-                        model_choice = gr.Dropdown(list(PROPOSAL_MODELS), value=propose.DEFAULT_MODEL, allow_custom_value=True, label="proposer model")
-                        propose_btn = gr.Button("Propose boxes (Claude)")
+        with gr.Tab("Fix"):
+            with gr.Row():
+                with gr.Column(scale=3):
+                    img = gr.HTML(value="", label="scan (press and drag to draw a box)", show_label=True, container=True,
+                                  html_template=STAGE_HTML, css_template=STAGE_CSS, js_on_load=STAGE_JS)
+                    status = gr.Textbox(label="status", lines=2, interactive=False)
+                with gr.Column(scale=1):
+                    file = gr.File(label="scan", file_types=["image"], type="filepath")
+                    mode = gr.Radio(list(STEP_INFO), value=RECIPE_MODE, label="step")
+                    info = gr.Markdown(STEP_INFO[RECIPE_MODE])
+                    gain = gr.Slider(0.1, 2.0, 1.3, step=0.05, label="strength (steps 1–2: gain · step 4: blend 0–1)")
+                    second = gr.Checkbox(True, label="leftover pass at half the tile (steps 1–2)")
+                    tile_choice = gr.Dropdown(list(TILE_CHOICES), value="auto", label="tile, px (steps 1–2: auto = 64 / 32 / 16 by image size)")
+                    max_stops = gr.Slider(0.25, 2.0, 1.0, step=0.25, label="max lift, stops (step 3)")
+                    whole_frame = gr.Checkbox(False, label="step 4: whole frame instead of leak boxes")
                     with gr.Row():
-                        yolo_weights = gr.Textbox(detect.DEFAULT_WEIGHTS, label="YOLO weights")
-                        yolo_conf = gr.Slider(0.05, 0.95, detect.DEFAULT_CONF, step=0.05, label="YOLO confidence")
-                    yolo_btn = gr.Button(yolo_button_label(), interactive=detect.available())
-                    proposal_choice = gr.Dropdown([], label="proposal", interactive=True)
-                    with gr.Row():
-                        accept_btn = gr.Button("Accept"); adjust_btn = gr.Button("Adjust"); dismiss_btn = gr.Button("Dismiss")
-                save_btn = gr.Button("Save full-resolution JPEG"); out_file = gr.File(label="result", interactive=False)
-                cmp_btn = gr.Button("Show original | current")
-        cmp = gr.Image(label="original | current", interactive=False, visible=True, height=360)
+                        apply_btn = gr.Button("Apply", variant="primary"); clear_btn = gr.Button("Clear boxes"); undo_btn = gr.Button("Undo")
+                    ref_btn = gr.Button("Next drag = reference (step 3)")
+                    save_btn = gr.Button("Save full-resolution JPEG"); out_file = gr.File(label="result", interactive=False)
+                    cmp_btn = gr.Button("Show original | current")
+            cmp = gr.Image(label="original | current", interactive=False, visible=True, height=360)
+
+        with gr.Tab("Compare"):
+            gr.Markdown("Measure how much each version changed the scan **outside** the leak boxes (ΔE76 / ΔE2000 after SIFT alignment). Load the original; its boxes come from the Fix tab's boxes.json when it is the same scan, from an uploaded boxes.json, or drag on the image to draw them.")
+            cstate = gr.State(None)
+            with gr.Row():
+                with gr.Column(scale=3):
+                    cimg = gr.HTML(value="", label="original (press and drag to draw a box)", show_label=True, container=True,
+                                   html_template=STAGE_HTML, css_template=STAGE_CSS, js_on_load=STAGE_JS)
+                    cstatus = gr.Textbox(label="status", lines=3, interactive=False)
+                with gr.Column(scale=1):
+                    coriginal = gr.File(label="original scan", file_types=["image"], type="filepath")
+                    cboxes = gr.File(label="boxes.json (optional)", file_types=[".json"], type="filepath")
+                    cclear = gr.Button("Clear drawn boxes")
+                    slot_inputs = []
+                    for index in range(1, COMPARE_SLOTS + 1):
+                        with gr.Row():
+                            slot_inputs.append(gr.File(label=f"version {index}", file_types=["image"], type="filepath"))
+                            slot_inputs.append(gr.Textbox(label=f"label {index}", placeholder="e.g. gemini-3.1-pro"))
+                    cmargin = gr.Number(collateral.DEFAULT_MARGIN, precision=0, label="margin around boxes, px")
+                    ccsv = gr.Textbox(COMPARE_CSV, label="CSV (rows appended)")
+                    cout = gr.Textbox(COMPARE_OUT_DIR, label="output folder")
+                    crun = gr.Button("Run", variant="primary")
+            cfigure = gr.Image(label="comparison", type="filepath", interactive=False)
+            ctable = gr.Markdown()
 
         file.change(load_image, [file, state], [state, img, status, info])
         mode.change(change_step, [mode, state], [info, img, gain, status])
         img.select(on_select, [state, mode], [state, img, status])
-        apply_btn.click(apply, [state, mode, gain, second, max_stops, whole_frame, tile_choice, inpaint_method, inpaint_mask], [state, img, status])
+        apply_btn.click(apply, [state, mode, gain, second, max_stops, whole_frame, tile_choice], [state, img, status])
         clear_btn.click(clear_boxes, [state, mode], [state, img, status])
         ref_btn.click(mark_next_as_reference, [state, mode], [state, img, status])
         undo_btn.click(undo, [state, mode], [state, img, status])
-        propose_btn.click(propose_click, [state, mode, model_choice], [state, img, status, proposal_choice])
-        yolo_btn.click(yolo_propose_click, [state, mode, yolo_weights, yolo_conf], [state, img, status, proposal_choice])
-        accept_btn.click(accept_proposal, [state, mode, proposal_choice], [state, img, status, proposal_choice])
-        adjust_btn.click(adjust_proposal, [state, mode, proposal_choice], [state, img, status, proposal_choice])
-        dismiss_btn.click(dismiss_proposal, [state, mode, proposal_choice], [state, img, status, proposal_choice])
         save_btn.click(save, [state], [out_file, status])
         cmp_btn.click(compare, [state], [cmp])
+        coriginal.change(compare_load_original, [coriginal, state], [cstate, cimg, cstatus])
+        cboxes.change(compare_load_boxes, [cboxes, cstate], [cstate, cimg, cstatus])
+        cimg.select(compare_on_select, [cstate], [cstate, cimg, cstatus])
+        cclear.click(compare_clear_drawn, [cstate], [cstate, cimg, cstatus])
+        crun.click(compare_run, [cstate, cmargin, ccsv, cout] + slot_inputs, [cfigure, ctable, cstatus])
     return demo
 
 

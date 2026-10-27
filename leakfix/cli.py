@@ -1,7 +1,7 @@
 import argparse, json, os, time
-from . import core, inpaint, recipe
+from . import core, recipe
 
-STEP_FILES = {"leak": "step1_deleak.jpg", "cool_tint": "step2_detint.jpg", "exposure": "step3_final.jpg", "hsv": "step4_hsv.jpg", "inpaint": "step5_inpaint.jpg"}
+STEP_FILES = {"leak": "step1_deleak.jpg", "cool_tint": "step2_detint.jpg", "exposure": "step3_final.jpg", "hsv": "step4_hsv.jpg"}
 
 def box(s): return tuple(int(v) for v in s.split(","))
 
@@ -27,7 +27,7 @@ def audited_boxes(a, stages, shape):
         return [b for st in stages for b in stage_audit_boxes(st, shape)]
     hsv_boxes = hsv_boxes_for(a, shape)
     if None in hsv_boxes: return whole_frame
-    return a.leak + a.tint + a.expose + hsv_boxes + list(a.inpaint)
+    return a.leak + a.tint + a.expose + hsv_boxes
 
 def step_file_path(out_path, stage):
     return os.path.join(os.path.dirname(out_path) or ".", STEP_FILES[stage])
@@ -36,11 +36,11 @@ def save_step(a, out_path, stage, rgb):
     if not a.save_steps: return
     path = step_file_path(out_path, stage); core.save(path, rgb); print("saved", path)
 
-REPLAY_STAGES = ("leak", "cool_tint", "exposure", "hsv", "inpaint", "recipe_v2")
+REPLAY_STAGES = ("leak", "cool_tint", "exposure", "hsv", "recipe_v2")
 REPLAY_DEFAULT_TILE = 64
 CLASSIC_GAIN = 1.3
 CLASSIC_TINT_GAIN = 0.9
-RECIPE_CONFLICTS = (("gain", "--gain"), ("tint_gain", "--tint-gain"), ("tint", "--tint"), ("expose", "--expose"), ("hsv", "--hsv"), ("hsv_box", "--hsv-box"), ("hsv_whole_frame", "--hsv-whole-frame"), ("inpaint", "--inpaint"), ("replay", "--replay"), ("ref", "--ref"), ("save_steps", "--save-steps"))
+RECIPE_CONFLICTS = (("gain", "--gain"), ("tint_gain", "--tint-gain"), ("tint", "--tint"), ("expose", "--expose"), ("hsv", "--hsv"), ("hsv_box", "--hsv-box"), ("hsv_whole_frame", "--hsv-whole-frame"), ("replay", "--replay"), ("ref", "--ref"), ("save_steps", "--save-steps"))
 
 def tile_choice(s):
     if s.lower() == "auto": return None
@@ -50,7 +50,6 @@ def tile_choice(s):
 def validate_stages(stages):
     for i, st in enumerate(stages):
         name = st.get("stage")
-        if name == "inpaint" and st.get("method") not in ("telea", "lama"): raise SystemExit(f"stage {i}: inpaint stage needs \"method\": \"telea\" or \"lama\" to replay")
         if name not in REPLAY_STAGES: raise SystemExit(f"stage {i}: unknown stage name {name!r}; expected one of {', '.join(REPLAY_STAGES)}")
         if name == "exposure" and not st.get("ref"): raise SystemExit(f"stage {i}: exposure stage has no ref box")
         if name == "recipe_v2":
@@ -68,7 +67,6 @@ def replay_stages(rgb, stages, original=None):
     for st in stages:
         if st["stage"] == "recipe_v2": rgb = replay_recipe_stage(rgb, st); print(f"replayed recipe_v2: {len(st['boxes'])} box(es)"); continue
         for b in st["boxes"]:
-            if st["stage"] == "inpaint": rgb, _ = inpaint.inpaint_residue(rgb, original, b, method=st["method"], mask_mode=st.get("mask_mode", "clip")); continue
             if st["stage"] == "leak": rgb, _, _ = core.deleak(rgb, b, gain=st["param"], tile=st.get("tile", REPLAY_DEFAULT_TILE))
             elif st["stage"] == "cool_tint": rgb, _, _ = core.detint(rgb, b, gain=st["param"], tile=st.get("tile", REPLAY_DEFAULT_TILE))
             elif st["stage"] == "exposure": rgb, _ = core.exposure_match(rgb, b, st["ref"], max_stops=st["param"])
@@ -94,9 +92,6 @@ def main():
     p.add_argument("--replay", default=None, help="boxes.json written by the app")
     p.add_argument("--hsv", type=float, default=None, help="final HSV warm-neutralize pass, blend strength 0-1 (e.g. 0.45); whole frame unless --hsv-box")
     p.add_argument("--hsv-box", type=box, action="append", default=[])
-    p.add_argument("--inpaint", type=box, action="append", default=[], help="step 5 box (opt-in): inpaint the clipped cores of the ORIGINAL inside this box")
-    p.add_argument("--inpaint-method", choices=("auto", "telea", "lama"), default="auto")
-    p.add_argument("--inpaint-mask", choices=("clip", "score", "box"), default="clip")
     p.add_argument("--hsv-whole-frame", action="store_true", help="run --hsv on the whole frame instead of inside the steps 1-3 boxes padded by one tile")
     p.add_argument("--save-steps", action="store_true", help="also write step1_deleak.jpg, step2_detint.jpg, step3_final.jpg, step4_hsv.jpg next to the output, one per step run")
     p.add_argument("--recipe", choices=("v2",), default=None, help="run recipe v2 on the --leak boxes (two deleak passes, gated blue tint, matched exposure, hsv, black-point floor, tile fade) and write <out>.boxes.json")
@@ -164,10 +159,6 @@ def apply_stages(a, rgb, stages, out):
             if hsv_boxes == [None] and not a.hsv_whole_frame and not a.hsv_box: print("no leak boxes: hsv runs on the whole frame")
             for b in hsv_boxes: rgb, frac = core.hsv_neutralize(rgb, b, strength=a.hsv); print(f"hsv {b or 'whole frame'}: mask {frac*100:.1f}%")
             save_step(a, out, "hsv", rgb)
-        for b in a.inpaint:
-            rgb, info = inpaint.inpaint_residue(rgb, original, b, method=a.inpaint_method, mask_mode=a.inpaint_mask)
-            print(f"inpaint {b}: mask {info['mask_fraction']*100:.2f}% " + (f"filled with {info['method']}" if info["applied"] else "not applied"))
-        if a.inpaint: save_step(a, out, "inpaint", rgb)
     return rgb
 
 if __name__ == "__main__":
