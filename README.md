@@ -41,41 +41,23 @@ If the detector misses a leak, lower `CONFIDENCE` or give the boxes yourself in 
 
 ## Finding the leaks: YOLO detector
 
-In the notebook, the leak boxes come from a YOLO object detector instead of being drawn by hand. For the tests below, I used the boxes I drew myself, so the comparison does not depend on the detector.
+In the notebook, the leak boxes come from a YOLO detector instead of being drawn by hand. The tests below use my hand-drawn boxes, so they do not depend on the detector.
 
-**What it does**
-
-1. Take the whole scan, resized so the long side is 1024 px.
-2. Return a box and a confidence score (0 to 1) for each light leak.
-3. Keep the boxes above the confidence threshold (0.25 by default). These are passed to the in-house method and shown before anything runs.
+**What it does:** it looks at the whole scan and draws a box around each light leak, with a confidence score from 0 to 1. Boxes above 0.25 are kept.
 
 **How it was trained**
 
-- **Data:** 174 of my scans. 171 have leak boxes I drew by hand, and 3 have no leak, so the model also sees negative examples.
-- **Split:** 126 scans to train on, 24 to tune on (validation) and 24 held back for the final test. Scans are grouped by the leak's shape (vertical band, horizontal band or edge leak) before splitting, so every split has a mix of leak types. The split is frozen, so retraining always tests on the same 24 scans.
-- **Model:** YOLO26m (20 M parameters), fine-tuned for up to 150 epochs, stopping early if the validation score stops improving for 30 epochs. The released model trained for 107 epochs.
-- **Augmentation:** horizontal and vertical flips, plus a copy of every training scan rotated 90°, because leaks can appear on any side of the frame. There is no colour augmentation: a leak is defined by its colour, so changing colours during training would teach the model the wrong thing.
+- 174 of my scans with leak boxes I drew by hand: 126 to train on, 24 to tune on and 24 to test on.
+- The scans are flipped and rotated during training, because a leak can appear on any side of the frame.
+- Colours are never changed during training, because a leak is defined by its colour.
 
-**Results on the 24 test scans (30 leaks)**
-
-| Precision | Recall | mAP50 | mAP50-95 |
-|---:|---:|---:|---:|
-| 0.40 | 0.53 | 0.47 | 0.16 |
-
-- **Precision:** the share of the detector's boxes that match a real leak.
-- **Recall:** the share of real leaks it finds.
-- **mAP50:** overall accuracy, counting a box as correct when it overlaps the true box by at least half. mAP50-95 uses stricter overlap thresholds.
-
-**Limits:** with only 126 training scans, the detector finds about half the leaks and its boxes are often looser than hand-drawn ones. Faint leaks can fall below the threshold. That is why the notebook shows the detected boxes before running anything, and lets you lower `CONFIDENCE` or give the boxes yourself in `MANUAL_BOXES`. More labelled scans should improve it.
+**Results on the 24 test scans:** it finds about half of the leaks (recall 0.53), and its overall accuracy is mAP50 0.47. Faint leaks can be missed, so the notebook shows the boxes first and lets you lower `CONFIDENCE` or give the boxes yourself in `MANUAL_BOXES`.
 
 **Train it yourself**
 
-    python -m leakfix.yolo_data --dataset dataset --out work/yolo      # labelled boxes -> YOLO dataset and split
+    python -m leakfix.yolo_data --dataset dataset --out work/yolo
     python -m leakfix.detect train work/yolo/data.yaml --out work/detect
     python -m leakfix.detect evaluate work/detect/weights/best.pt work/yolo/data.yaml
-    python -m leakfix.detect propose models/leak_detector.pt scan.jpg
-
-`dataset/` holds one `<scan>.boxes.json` per labelled scan, with the scans in `photos/original/`. Training needs the `detect` extra (`pip install -e ".[detect]"`) and a GPU is recommended.
 
 ## Preprocessing: the in-house method
 
